@@ -36,6 +36,7 @@ from urllib.error import URLError, HTTPError
 
 import llama_cpp.llama_cpp as llama_cpp_lib
 import llama_cpp.llama as llama_core
+from .llama import active_seq_id
 import llama_cpp.llama_types as llama_types
 import llama_cpp.llama_grammar as llama_grammar
 
@@ -3311,6 +3312,7 @@ while also answering every question accurately, clearly, and step-by-step when a
         llama_types.CreateChatCompletionResponse,
         Iterator[llama_types.CreateChatCompletionStreamResponse],
     ]:
+        seq_id = active_seq_id.get()
         # 1. Initialize mtmd context
         self._init_mtmd_context(llama)
         assert self.mtmd_ctx is not None
@@ -3341,8 +3343,8 @@ while also answering every question accurately, clearly, and step-by-step when a
                             print(f"{self.log_prefix}(__call__): Hybrid prefix mismatch (matched {longest_prefix}/{llama.n_tokens}). "
                                 f"Searching for nearest checkpoint...", file=sys.stderr)
 
-                        best_ckpt = llama._hybrid_cache_mgr.find_best_checkpoint(full_prompt_ids, seq_id=0)
-                        if best_ckpt and llama._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
+                        best_ckpt = llama._hybrid_cache_mgr.find_best_checkpoint(full_prompt_ids, seq_id=seq_id)
+                        if best_ckpt and llama._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=seq_id):
                             llama.n_tokens = best_ckpt.pos
                             if self.verbose:
                                 print(f"{self.log_prefix}(__call__): Successfully rolled back to checkpoint at pos {llama.n_tokens}.", file=sys.stderr)
@@ -3361,7 +3363,7 @@ while also answering every question accurately, clearly, and step-by-step when a
                 else:
                     if self.verbose:
                         print(f"{self.log_prefix}(__call__): Prefix mismatch. Truncating KV cache from {llama.n_tokens} to {longest_prefix}.", file=sys.stderr)
-                    llama._ctx.memory_seq_rm(0, longest_prefix, -1)
+                    llama._ctx.memory_seq_rm(seq_id, longest_prefix, -1)
                     llama.n_tokens = longest_prefix
 
             n_past = llama.n_tokens
@@ -3384,7 +3386,7 @@ while also answering every question accurately, clearly, and step-by-step when a
                             if self.verbose:
                                 print(f"{self.log_prefix}(__call__): Evaluating TEXT chunk ({len(tokens_to_eval)} tokens) at pos {llama.n_tokens}...", file=sys.stderr)
                             # Text evaluation delegates shift and chunking to native llama.eval
-                            llama.eval(tokens_to_eval)
+                            llama.eval(tokens_to_eval, seq_id=seq_id)
                             n_past = llama.n_tokens
 
                 elif chunk_type in [
@@ -3419,8 +3421,8 @@ while also answering every question accurately, clearly, and step-by-step when a
                                 print(f"{self.log_prefix}(__call__): OOM risk detected. Shifting multimodal context: keeping {n_keep}, discarding {n_discard}...", file=sys.stderr)
 
                             # Execute physical memory shift
-                            llama._ctx.memory_seq_rm(0, n_keep, n_keep + n_discard)
-                            llama._ctx.memory_seq_add(0, n_keep + n_discard, n_past, -n_discard)
+                            llama._ctx.memory_seq_rm(seq_id, n_keep, n_keep + n_discard)
+                            llama._ctx.memory_seq_add(seq_id, n_keep + n_discard, n_past, -n_discard)
 
                             # Shift python virtual array to match
                             remaining_len = n_past - (n_keep + n_discard)
@@ -3437,7 +3439,7 @@ while also answering every question accurately, clearly, and step-by-step when a
                         llama._ctx.ctx,
                         chunk_ptr,
                         llama_cpp_lib.llama_pos(n_past),
-                        llama_cpp_lib.llama_seq_id(0),
+                        llama_cpp_lib.llama_seq_id(seq_id),
                         llama.n_batch,
                         True, # logits_last = True, drastically saves computational overhead
                         ctypes.byref(new_n_past)
@@ -3467,7 +3469,7 @@ while also answering every question accurately, clearly, and step-by-step when a
                 llama._hybrid_cache_mgr.save_checkpoint(
                     current_pos=llama.n_tokens,
                     tokens=prompt,
-                    seq_id=0
+                    seq_id=seq_id
                 )
         finally:
             # Cleanup chunks
