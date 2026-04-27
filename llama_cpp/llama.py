@@ -839,6 +839,7 @@ class Llama:
         if self.verbose:
             print(f"Llama.abort: Abort signal received. Terminating generation...", file=sys.stderr)
         self._abort_event.set()
+        self._ctx.memory_seq_rm(seq_id, 0, -1)
 
     def eval(
             self,
