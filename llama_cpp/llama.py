@@ -12,6 +12,9 @@ import fnmatch
 import warnings
 import contextlib
 import multiprocessing
+import contextvars
+
+active_seq_id = contextvars.ContextVar('active_seq_id', default=0)
 
 from typing import (
     Any,
@@ -523,9 +526,14 @@ class Llama:
 
         self._candidates = internals.LlamaTokenDataArray(n_vocab=self._n_vocab)
 
-        self.n_tokens = 0
-        self.input_ids: npt.NDArray[np.intc] = np.ndarray((n_ctx,), dtype=np.intc)
-        self.scores: npt.NDArray[np.single] = np.ndarray((n_ctx if self._logits_all else 1, self._n_vocab), dtype=np.single)
+        self._n_tokens_dict = {}
+        self._input_ids_dict = {}
+        self._scores_dict = {}
+        
+        # Init default seq 0
+        self._n_tokens_dict[0] = 0
+        self._input_ids_dict[0] = np.ndarray((self._n_ctx,), dtype=np.intc)
+        self._scores_dict[0] = np.ndarray((self._n_ctx if self._logits_all else 1, self._n_vocab), dtype=np.single)
 
 
         self._mirostat_mu = ctypes.c_float(
@@ -658,6 +666,43 @@ class Llama:
     def __del__(self) -> None:
         self.close()
 
+
+    @property
+    def n_tokens(self) -> int:
+        seq = active_seq_id.get()
+        if seq not in self._n_tokens_dict:
+            self._n_tokens_dict[seq] = 0
+        return self._n_tokens_dict[seq]
+
+    @n_tokens.setter
+    def n_tokens(self, value: int):
+        seq = active_seq_id.get()
+        self._n_tokens_dict[seq] = value
+
+    @property
+    def input_ids(self) -> npt.NDArray[np.intc]:
+        seq = active_seq_id.get()
+        if seq not in self._input_ids_dict:
+            self._input_ids_dict[seq] = np.ndarray((self._n_ctx,), dtype=np.intc)
+        return self._input_ids_dict[seq]
+
+    @input_ids.setter
+    def input_ids(self, value):
+        seq = active_seq_id.get()
+        self._input_ids_dict[seq] = value
+
+    @property
+    def scores(self) -> npt.NDArray[np.single]:
+        seq = active_seq_id.get()
+        if seq not in self._scores_dict:
+            self._scores_dict[seq] = np.ndarray((self._n_ctx if self._logits_all else 1, self._n_vocab), dtype=np.single)
+        return self._scores_dict[seq]
+
+    @scores.setter
+    def scores(self, value):
+        seq = active_seq_id.get()
+        self._scores_dict[seq] = value
+
     @property
     def ctx(self) -> llama_cpp.llama_context_p:
         return self._ctx.ctx
@@ -765,17 +810,21 @@ class Llama:
         """
         self._seed = seed
 
-    def reset(self):
+    def reset(self, seq_id: Optional[int] = None):
         """Reset the model state."""
+        seq_id = seq_id if seq_id is not None else active_seq_id.get()
         self.n_tokens = 0
+        self._ctx.memory_seq_rm(seq_id, 0, -1)
 
     def eval(
             self,
             tokens: Sequence[int],
             active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
             control_vector: Optional[Dict[str, Any]] = None,
+            seq_id: Optional[int] = None,
     ):
         """Evaluate a list of tokens.
+        seq_id = seq_id if seq_id is not None else active_seq_id.get()
 
         Args:
             tokens: The list of tokens to evaluate.
@@ -822,10 +871,10 @@ class Llama:
 
                 try:
                     # Remove the specified block of tokens from the physical KV cache
-                    self._ctx.memory_seq_rm(0, _n_keep, _n_keep + _n_discard)
+                    self._ctx.memory_seq_rm(seq_id, _n_keep, _n_keep + _n_discard)
 
                     # Shift the positional IDs of all subsequent tokens to the left to close the gap
-                    self._ctx.memory_seq_add(0, _n_keep + _n_discard, self.n_tokens, -_n_discard)
+                    self._ctx.memory_seq_add(seq_id, _n_keep + _n_discard, self.n_tokens, -_n_discard)
                 except Exception as e:
                     # Defense-in-depth: Catch any other recoverable backend errors
                     raise RuntimeError(f"Llama.eval: Context Shift failed at the C++ level. Error: {str(e)}") from e
@@ -874,7 +923,7 @@ class Llama:
             self._batch.add_sequence(
                 token_array=chunk,
                 pos_array=pos_array,
-                seq_ids=[0],
+                seq_ids=[seq_id],
                 logits_array=logits_array
             )
 
@@ -977,7 +1026,7 @@ class Llama:
                     success = self._hybrid_cache_mgr.save_checkpoint(
                         current_pos=current_pos,
                         tokens=self.input_ids[:current_pos].tolist(),
-                        seq_id=0
+                        seq_id=seq_id
                     )
                     if success:
                         last_ckpt_pos = current_pos
@@ -1179,8 +1228,10 @@ class Llama:
         seed: Optional[int] = None,
         active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
         control_vector: Optional[Dict[str, Any]] = None,
+        seq_id: Optional[int] = None,
     ) -> Generator[int, Optional[Sequence[int]], None]:
         """Create a generator of tokens from a prompt.
+        seq_id = seq_id if seq_id is not None else active_seq_id.get()
 
         Examples:
             >>> llama = Llama("models/ggml-7b.bin")
@@ -1286,8 +1337,8 @@ class Llama:
                             if self.verbose:
                                 print(f"Llama.generate: Hybrid model rollback triggered.", file=sys.stderr)
 
-                            best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(original_tokens, 0)
-                            if best_ckpt is not None and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
+                            best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(original_tokens, seq_id)
+                            if best_ckpt is not None and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=seq_id):
                                 actual_prefix = best_ckpt.pos
                             else:
                                 # Fallback: No checkpoint found, must fully clear the context to prevent poisoning
@@ -1306,7 +1357,7 @@ class Llama:
                         else:
                             if self.verbose:
                                 print(f"Llama.generate: Truncating KV cache size from {self.n_tokens} to {longest_prefix}", file=sys.stderr)
-                            self._ctx.memory_seq_rm(0, longest_prefix, -1)
+                            self._ctx.memory_seq_rm(seq_id, longest_prefix, -1)
 
                             # Adjust the tokens array and cursor to reuse the matched cache
                             self.n_tokens = longest_prefix
@@ -1425,20 +1476,20 @@ class Llama:
                         last_token = [tokens[-1]]
 
                         # 1. Evaluate up to N-1
-                        self.eval(body_tokens, active_loras=active_loras, control_vector=control_vector)
+                        self.eval(body_tokens, active_loras=active_loras, control_vector=control_vector, seq_id=seq_id)
 
                         # 2. Save the N-1 state snapshot
                         current_history = self._input_ids[:self.n_tokens].tolist()
                         self._hybrid_cache_mgr.save_checkpoint(
                             current_pos=self.n_tokens,
                             tokens=current_history,
-                            seq_id=0
+                            seq_id=seq_id
                         )
                         # 3. Evaluate the final token to refresh logits
-                        self.eval(last_token, active_loras=active_loras, control_vector=control_vector)
+                        self.eval(last_token, active_loras=active_loras, control_vector=control_vector, seq_id=seq_id)
                     else:
                         # Standard evaluation or single-token generation step
-                        self.eval(tokens, active_loras=active_loras, control_vector=control_vector)
+                        self.eval(tokens, active_loras=active_loras, control_vector=control_vector, seq_id=seq_id)
 
                 # Sample loop
                 while sample_idx < self.n_tokens:
@@ -1482,8 +1533,8 @@ class Llama:
                             if self.verbose:
                                 print("Llama.generate: Draft token rejected for Hybrid model. Rolling back via Checkpoint.", file=sys.stderr)
                             if self._hybrid_cache_mgr:
-                                best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(self._input_ids[:self.n_tokens].tolist(), 0)
-                                if best_ckpt and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=0):
+                                best_ckpt = self._hybrid_cache_mgr.find_best_checkpoint(self._input_ids[:self.n_tokens].tolist(), seq_id)
+                                if best_ckpt and self._hybrid_cache_mgr.restore_checkpoint(best_ckpt, seq_id=seq_id):
                                     self.n_tokens = best_ckpt.pos
                                 else:
                                     self._hybrid_cache_mgr.clear()
@@ -1492,7 +1543,7 @@ class Llama:
                         else:
                             if self.verbose:
                                 print(f"Llama.generate: Draft token rejected. Truncating context to {self.n_tokens}.", file=sys.stderr)
-                            self._ctx.memory_seq_rm(0, self.n_tokens, -1)
+                            self._ctx.memory_seq_rm(seq_id, self.n_tokens, -1)
 
                         break
 
@@ -1523,7 +1574,7 @@ class Llama:
                 self._hybrid_cache_mgr.save_checkpoint(
                     current_pos=self.n_tokens,
                     tokens=current_history,
-                    seq_id=0
+                    seq_id=seq_id
                 )
 
     def create_embedding(
@@ -1742,9 +1793,11 @@ class Llama:
         seed: Optional[int] = None,
         active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
         control_vector: Optional[Dict[str, Any]] = None,
+        seq_id: Optional[int] = None,
     ) -> Union[
         Iterator[CreateCompletionResponse], Iterator[CreateCompletionStreamResponse]
     ]:
+        seq_id = seq_id if seq_id is not None else active_seq_id.get()
         assert suffix is None or suffix.__class__ is str
 
         completion_id: str = f"cmpl-{str(uuid.uuid4())}"
@@ -1923,6 +1976,7 @@ class Llama:
             seed=seed if seed is not None else self._seed,
             active_loras=active_loras,
             control_vector=control_vector,
+            seq_id=seq_id,
         ):
             if llama_cpp.llama_token_is_eog(self._model.vocab, token):
                 text = self.detokenize(completion_tokens, prev_tokens=prompt_tokens)
@@ -2377,8 +2431,10 @@ class Llama:
         grammar_lazy: bool = False,
         active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
         control_vector: Optional[Dict[str, Any]] = None,
+        seq_id: Optional[int] = None,
     ) -> Union[CreateCompletionResponse, Iterator[CreateCompletionStreamResponse]]:
         """Generate text from a prompt.
+        seq_id = seq_id if seq_id is not None else active_seq_id.get()
 
         Args:
 prompt: The prompt to generate text from.
@@ -2480,6 +2536,7 @@ prompt: The prompt to generate text from.
             grammar_lazy=grammar_lazy,
             active_loras=active_loras,
             control_vector=control_vector,
+            seq_id=seq_id,
         )
         if stream:
             chunks: Iterator[CreateCompletionStreamResponse] = completion_or_chunks
@@ -2531,8 +2588,10 @@ prompt: The prompt to generate text from.
         grammar_lazy: bool = False,
         active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
         control_vector: Optional[Dict[str, Any]] = None,
+        seq_id: Optional[int] = None,
     ) -> Union[CreateCompletionResponse, Iterator[CreateCompletionStreamResponse]]:
         """Generate text from a prompt.
+        seq_id = seq_id if seq_id is not None else active_seq_id.get()
 
         Args:
             prompt: The prompt to generate text from.
@@ -2634,6 +2693,7 @@ prompt: The prompt to generate text from.
             grammar_lazy=grammar_lazy,
             active_loras=active_loras,
             control_vector=control_vector,
+            seq_id=seq_id,
         )
 
     def create_chat_completion(
@@ -2684,10 +2744,12 @@ prompt: The prompt to generate text from.
         logprobs: Optional[bool] = None,
         top_logprobs: Optional[int] = None,
         assistant_prefill: bool = False,
+        seq_id: Optional[int] = None,
     ) -> Union[
         CreateChatCompletionResponse, Iterator[CreateChatCompletionStreamResponse]
     ]:
         """Generate a chat completion from a list of messages.
+        seq_id = seq_id if seq_id is not None else active_seq_id.get()
 
         Args:
             messages: A list of messages to generate a response for.
@@ -2796,6 +2858,7 @@ prompt: The prompt to generate text from.
             active_loras=active_loras,
             control_vector=control_vector,
             assistant_prefill=assistant_prefill,
+            seq_id=seq_id,
         )
 
     def create_chat_completion_openai_v1(
