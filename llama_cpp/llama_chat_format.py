@@ -2907,7 +2907,7 @@ while also answering every question accurately, clearly, and step-by-step when a
         self.mctx_params.use_gpu = self.use_gpu
         self.mctx_params.print_timings = self.verbose
         self.mctx_params.n_threads = llama_model.n_threads
-        self.mctx_params.flash_attn_type  = self._mtmd_cpp.clip_flash_attn_type.CLIP_FLASH_ATTN_TYPE_AUTO
+        self.mctx_params.flash_attn_type = llama_model.context_params.flash_attn_type
         self.mctx_params.warmup = True
         if self.image_min_tokens > 0:
             self.mctx_params.image_min_tokens = self.image_min_tokens
