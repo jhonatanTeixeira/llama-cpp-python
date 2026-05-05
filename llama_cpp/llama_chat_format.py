@@ -2907,8 +2907,20 @@ while also answering every question accurately, clearly, and step-by-step when a
         self.mctx_params.use_gpu = self.use_gpu
         self.mctx_params.print_timings = self.verbose
         self.mctx_params.n_threads = llama_model.n_threads
-        self.mctx_params.flash_attn_type = llama_model.context_params.flash_attn_type
+        fa_type = int(getattr(llama_model.context_params, "flash_attn_type", -1))
+        self.mctx_params.flash_attn_type = fa_type if fa_type >= 0 else 0
         self.mctx_params.warmup = True
+        
+        n_batch = getattr(llama_model.context_params, "n_batch", 512)
+        if n_batch < 256:
+            import warnings
+            warnings.warn(
+                f"[{self.log_prefix}] n_batch={n_batch} é muito pequeno para modelos de visão. "
+                f"Recomenda-se n_batch >= 2048 para Gemma-4/Qwen3.5-VL. "
+                f"Isso pode causar crashes com 'free() invalid pointer'.",
+                RuntimeWarning,
+                stacklevel=3
+            )
         if self.image_min_tokens > 0:
             self.mctx_params.image_min_tokens = self.image_min_tokens
         if self.image_max_tokens > 0:
@@ -3401,7 +3413,7 @@ while also answering every question accurately, clearly, and step-by-step when a
 
                     # Stage 5: Multimodal Physical OOM Defense
                     if n_past + chunk_n_tokens > llama.n_ctx():
-                        if llama._ctx.memory_can_shift():
+                        if not llama._ctx.memory_can_shift():
                             raise RuntimeError(
                                 f"{self.log_prefix}(__call__): Context Shift is explicitly disabled by the C++ backend "
                                 f"(n_pos_per_embd > 1 or incompatible M-RoPE). "
@@ -3451,7 +3463,7 @@ while also answering every question accurately, clearly, and step-by-step when a
                     # Update Ledger with "Negative Reverse Vocabulary" IDs
                     llama.input_ids[n_past : new_n_past.value] = media_id
                     n_past = new_n_past.value
-                    llama.n_tokens = n_past
+                    llama.n_tokens = int(n_past)  # sincronizar estado Python <-> C
 
             # Extract the final, perfectly synchronized prompt sequence
             prompt = llama.input_ids[: llama.n_tokens].tolist()
@@ -4336,8 +4348,20 @@ class Gemma3ChatHandler(MTMDChatHandler):
         "{% endif %}"
     )
 
-
 class Gemma4ChatHandler(MTMDChatHandler):
+    def __call__(self, *args, **kwargs):
+        # Antes de processar, verificar se n_batch é seguro para os tiles
+        llama_model = kwargs.get("llama", args[0] if args else None)
+        if llama_model is not None:
+            n_batch = getattr(llama_model.context_params, "n_batch", 512)
+            # Gemma-4 pode ter tiles de até 1120 tokens (image-max-tokens=1120)
+            # n_batch precisa ser >= 1 tile completo para evitar KV cache SWA corruption
+            if n_batch < 512:
+                raise ValueError(
+                    f"n_batch={n_batch} é insuficiente para Gemma4ChatHandler. "
+                    f"Use n_batch >= 2048 (recomendado) ou no mínimo 512."
+                )
+        return super().__call__(*args, **kwargs)
     """
     Handler for Gemma 4 models.
 
