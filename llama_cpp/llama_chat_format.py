@@ -7,8 +7,10 @@ import datetime
 import json
 import os
 import random
+import re
 import string
 import sys
+import uuid
 import zlib
 
 from contextlib import ExitStack
@@ -4349,19 +4351,6 @@ class Gemma3ChatHandler(MTMDChatHandler):
     )
 
 class Gemma4ChatHandler(MTMDChatHandler):
-    def __call__(self, *args, **kwargs):
-        # Antes de processar, verificar se n_batch é seguro para os tiles
-        llama_model = kwargs.get("llama", args[0] if args else None)
-        if llama_model is not None:
-            n_batch = getattr(llama_model.context_params, "n_batch", 512)
-            # Gemma-4 pode ter tiles de até 1120 tokens (image-max-tokens=1120)
-            # n_batch precisa ser >= 1 tile completo para evitar KV cache SWA corruption
-            if n_batch < 512:
-                raise ValueError(
-                    f"n_batch={n_batch} é insuficiente para Gemma4ChatHandler. "
-                    f"Use n_batch >= 2048 (recomendado) ou no mínimo 512."
-                )
-        return super().__call__(*args, **kwargs)
     """
     Handler for Gemma 4 models.
 
@@ -4750,17 +4739,159 @@ class Gemma4ChatHandler(MTMDChatHandler):
         super().__init__(**kwargs)
 
     def __call__(self, **kwargs):
-        # Inject the thinking variable into the Jinja environment
-        self.extra_template_arguments["enable_thinking"] = self.enable_thinking
+        # Validate n_batch is sufficient for Gemma4 tiles (up to 1120 tokens per tile)
+        llama = kwargs.get("llama")
+        if llama is not None:
+            ctx_params = getattr(llama, "context_params", None)
+            n_batch = getattr(ctx_params, "n_batch", 512) if ctx_params else 512
+            if n_batch < 512:
+                raise ValueError(
+                    f"n_batch={n_batch} is insufficient for Gemma4ChatHandler. "
+                    f"Use n_batch >= 2048 (recommended) or minimum 512."
+                )
 
-        # Set the stop token based on Gemma 4's format (<turn|>)
-        # generation_config.json:   "eos_token_id": [ 1, 106, 50]
+        # Normalize messages: flatten list content, parse tool_call arguments to dicts
+        messages = kwargs.get("messages", [])
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                has_image = any(
+                    isinstance(p, dict) and p.get("type") in ["image_url", "image"]
+                    for p in content
+                )
+                if not has_image:
+                    text_parts = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            text_parts.append(p.get("text", ""))
+                        elif isinstance(p, str):
+                            text_parts.append(p)
+                    message["content"] = "\n".join(text_parts)
+            if message.get("tool_calls"):
+                for tc in message["tool_calls"]:
+                    f = tc.get("function")
+                    if f and isinstance(f.get("arguments"), str):
+                        try:
+                            f["arguments"] = json.loads(f["arguments"])
+                        except Exception:
+                            pass
+
+        self.extra_template_arguments["enable_thinking"] = self.enable_thinking
         kwargs['stop'] = [self.GEMMA4_EOS_TOKEN, self.GEMMA4_EOT_TOKEN, self.GEMMA4_STR_TOKEN]
 
         if self.verbose:
             print(f"{self.log_prefix}(enable_thinking={self.enable_thinking}) - Start processing")
 
-        return super().__call__(**kwargs)
+        response = super().__call__(**kwargs)
+
+        if kwargs.get("stream"):
+            return self._stream_response(response)
+        else:
+            return self._parse_response(response)
+
+    def _parse_response(self, response):
+        message = response.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "") or ""
+
+        if not isinstance(content, str):
+            return response
+
+        thinking_pattern = re.compile(r'<\|channel>thought([\s\S]*?)(?:<channel\|>|$)', re.DOTALL)
+        think_match = thinking_pattern.search(content)
+        reasoning = None
+
+        if think_match:
+            reasoning = think_match.group(1).strip()
+            content = content.replace(think_match.group(0), "")
+
+        tool_call_pattern = re.compile(r'<\|tool_call>(.*?)<tool_call\|>', re.DOTALL)
+        parsed_tools = []
+
+        for tc_match in tool_call_pattern.finditer(content):
+            raw_tc = tc_match.group(1).replace('<|"|>', '"')
+            for call_block in raw_tc.split('call:'):
+                if not call_block.strip():
+                    continue
+                fn_match = re.match(r'(\w+)(\{.*\})', call_block, re.DOTALL)
+                if not fn_match:
+                    continue
+                name = fn_match.group(1)
+                args = fn_match.group(2)
+                args = re.sub(r'([{,])\s*([a-zA-Z0-9_-]+)\s*:', r'\1"\2":', args)
+                parsed_tools.append({
+                    "id": f"call_{uuid.uuid4().hex}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                })
+
+        content = tool_call_pattern.sub('', content)
+        content = content.replace('<|"|>', '"').strip() or None
+
+        message["content"] = content
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if parsed_tools:
+            message["tool_calls"] = parsed_tools
+            response["choices"][0]["finish_reason"] = "tool_calls"
+
+        return response
+
+    def _stream_response(self, response):
+        from copy import deepcopy
+        channel = None
+        tools_calls = ""
+        called_tools = False
+
+        for chunk in response:
+            content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+
+            if content == '<|channel>':
+                channel = "enter"
+                continue
+            if channel == 'enter':
+                if content == 'thought':
+                    channel = "think"
+                    copy = deepcopy(chunk)
+                    copy["choices"][0]["delta"]["content"] = "<think>"
+                    yield copy
+                    continue
+            if channel == "think" and content != "<channel|>":
+                yield chunk
+                continue
+            if content == "<channel|>" and channel == "think":
+                copy = deepcopy(chunk)
+                copy["choices"][0]["delta"]["content"] = "</think>"
+                channel = None
+                yield copy
+                continue
+            if content == "<|tool_call>":
+                channel = "tool_call"
+                called_tools = True
+                continue
+            if content == "<tool_call|>":
+                channel = None
+                for idx, tool_call in enumerate(tools_calls.replace('<|"|>', '"').split('call:')):
+                    if not tool_call.strip():
+                        continue
+                    matches = re.match(r'(\w+)(\{.*\})', tool_call, re.DOTALL)
+                    if matches:
+                        name = matches.group(1)
+                        args = re.sub(r'([{,])\s*([a-zA-Z0-9_-]+)\s*:', r'\1"\2":', matches.group(2))
+                        tool_id = f"call_{uuid.uuid4().hex[:10]}"
+                        yield {"choices": [{"delta": {"tool_calls": [{"index": idx, "id": tool_id, "type": "function", "function": {"name": name}}]}}]}
+                        yield {"choices": [{"delta": {"tool_calls": [{"index": idx, "id": tool_id, "function": {"arguments": args}}]}}]}
+                tools_calls = ""
+                continue
+            if chunk.get("choices", [{}])[0].get("finish_reason") == "stop" and called_tools:
+                copy = deepcopy(chunk)
+                copy["choices"][0]["delta"]["content"] = ""
+                copy["choices"][0]["finish_reason"] = "tool_calls"
+                yield copy
+                continue
+            if channel == "tool_call":
+                tools_calls += content or ""
+                continue
+            yield chunk
 
 
 class GLM41VChatHandler(MTMDChatHandler):
@@ -4900,18 +5031,162 @@ class GLM46VChatHandler(MTMDChatHandler):
         self.extra_template_arguments["enable_thinking"] = self.enable_thinking
         self.extra_template_arguments["GLM46V_EOS_TOKEN"] = self.GLM46V_EOS_TOKEN
 
-        # https://huggingface.co/zai-org/GLM-4.6V-Flash/blob/main/generation_config.json
-        kwargs['stop'] = [self.GLM46V_EOS_TOKEN, "<|user|>", "<|observation|>", "<|code_middle|>"] # Stop token patch
+        kwargs['stop'] = [self.GLM46V_EOS_TOKEN, "<|user|>", "<|observation|>", "<|code_middle|>"]
 
         llama = kwargs['llama']
-
         if hasattr(llama, 'input_ids'):
             llama.input_ids.fill(0)
 
         if self.verbose:
             print(f"{self.log_prefix}(enable_thinking={self.enable_thinking}) - Start processing")
 
-        return super().__call__(**kwargs)
+        response = super().__call__(**kwargs)
+
+        if kwargs.get("stream"):
+            return self._stream_response(response)
+        else:
+            return self._parse_response(response)
+
+    @staticmethod
+    def _parse_glm46_tool_call(raw: str) -> Optional[Dict[str, Any]]:
+        """Parse GLM4.6V tool call format: {name}\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>"""
+        lines = raw.strip().splitlines()
+        if not lines:
+            return None
+        name = lines[0].strip()
+        keys = re.findall(r'<arg_key>(.*?)</arg_key>', raw, re.DOTALL)
+        vals = re.findall(r'<arg_value>(.*?)</arg_value>', raw, re.DOTALL)
+        args = {k.strip(): v.strip() for k, v in zip(keys, vals)}
+        return {"name": name, "arguments": args}
+
+    def _parse_response(self, response):
+        message = response.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "") or ""
+
+        if not isinstance(content, str):
+            return response
+
+        # Extract thinking: <think>...</think>
+        think_match = re.search(r'<think>([\s\S]*?)</think>', content, re.DOTALL)
+        reasoning = None
+        if think_match:
+            reasoning = think_match.group(1).strip()
+            content = content.replace(think_match.group(0), "")
+
+        # Extract tool calls: <tool_call>name\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>\n</tool_call>
+        tool_call_pattern = re.compile(r'<tool_call>([\s\S]*?)</tool_call>', re.DOTALL)
+        parsed_tools = []
+
+        for tc_match in tool_call_pattern.finditer(content):
+            parsed = self._parse_glm46_tool_call(tc_match.group(1))
+            if parsed:
+                parsed_tools.append({
+                    "id": f"call_{uuid.uuid4().hex}",
+                    "type": "function",
+                    "function": {
+                        "name": parsed["name"],
+                        "arguments": json.dumps(parsed["arguments"]),
+                    },
+                })
+
+        content = tool_call_pattern.sub("", content).strip() or None
+        message["content"] = content
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if parsed_tools:
+            message["tool_calls"] = parsed_tools
+            response["choices"][0]["finish_reason"] = "tool_calls"
+
+        return response
+
+    def _stream_response(self, response: Iterator):
+        buffer = ""
+        in_think = False
+        in_tool_call = False
+        called_tools = False
+
+        for chunk in response:
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            content = delta.get("content", "") or ""
+            buffer += content
+
+            if not in_think and '<think>' in buffer:
+                in_think = True
+                before, after = buffer.split('<think>', 1)
+                if before:
+                    c = json.loads(json.dumps(chunk))
+                    c["choices"][0]["delta"]["content"] = before
+                    yield c
+                buffer = after
+                continue
+
+            if in_think and '</think>' in buffer:
+                thinking_text, rest = buffer.split('</think>', 1)
+                buffer = rest
+                in_think = False
+                if thinking_text.strip():
+                    c = json.loads(json.dumps(chunk))
+                    c["choices"][0]["delta"]["reasoning_content"] = thinking_text
+                    c["choices"][0]["delta"].pop("content", None)
+                    yield c
+                continue
+
+            if in_think:
+                c = json.loads(json.dumps(chunk))
+                c["choices"][0]["delta"]["reasoning_content"] = buffer
+                c["choices"][0]["delta"].pop("content", None)
+                yield c
+                buffer = ""
+                continue
+
+            if not in_tool_call and '<tool_call>' in buffer:
+                in_tool_call = True
+                called_tools = True
+                before, after = buffer.split('<tool_call>', 1)
+                if before:
+                    c = json.loads(json.dumps(chunk))
+                    c["choices"][0]["delta"]["content"] = before
+                    yield c
+                buffer = after
+                continue
+
+            if in_tool_call and '</tool_call>' in buffer:
+                raw_tc, rest = buffer.split('</tool_call>', 1)
+                buffer = rest
+                in_tool_call = False
+                parsed = self._parse_glm46_tool_call(raw_tc)
+                if parsed:
+                    uid = uuid.uuid4().hex[:10]
+                    c_head = json.loads(json.dumps(chunk))
+                    c_head["choices"][0]["delta"]["tool_calls"] = [
+                        {"index": 0, "id": f"call_{uid}", "type": "function", "function": {"name": parsed["name"]}}
+                    ]
+                    yield c_head
+                    c_args = json.loads(json.dumps(chunk))
+                    c_args["choices"][0]["delta"]["tool_calls"] = [
+                        {"index": 0, "id": f"call_{uid}", "function": {"arguments": json.dumps(parsed["arguments"])}}
+                    ]
+                    yield c_args
+                continue
+
+            if in_tool_call:
+                continue
+
+            if buffer and not in_think:
+                c = json.loads(json.dumps(chunk))
+                c["choices"][0]["delta"]["content"] = buffer
+                yield c
+                buffer = ""
+
+        if called_tools:
+            import time as _time
+            yield {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion.chunk",
+                "created": int(_time.time()),
+                "model": "glm46v",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            }
 
 
 class GraniteDoclingChatHandler(MTMDChatHandler):
@@ -4986,6 +5261,72 @@ class GraniteDoclingChatHandler(MTMDChatHandler):
         if self.verbose:
             print(f"{self.log_prefix} - Start processing")
 
+
+        return super().__call__(**kwargs)
+
+
+class GraniteSpeechChatHandler(MTMDChatHandler):
+    """
+    Handler for IBM Granite 4.0 Speech (granite-4.0-1b-speech) models.
+
+    Architecture: Conformer audio encoder → QFormer projector → Granite LLM decoder.
+    The mmproj GGUF encodes the audio encoder weights (projector_type = "granite_speech").
+
+    Input format: pass audio as content type "audio_url" or "input_audio" (wav/mp3).
+    The MTMD layer processes the audio and injects embeddings at the placeholder position.
+
+    Note: The mmproj GGUF must be built from the HuggingFace release using the granite
+          conversion scripts. F32/BF16 mmproj is recommended to avoid quality degradation.
+    """
+
+    GRANITE_BOS_TOKEN = "<|start_of_role|>"
+    GRANITE_EOS_TOKEN = "<|end_of_text|>"
+    GRANITE_PAD_TOKEN = "<|end_of_text|>"
+
+    CHAT_FORMAT = (
+        "{%- for message in messages -%}"
+            "{{- '<|start_of_role|>' + message['role'] + '<|end_of_role|>' -}}"
+            "{%- if message['content'] is string -%}"
+                "{{- message['content'] -}}"
+            "{%- else -%}"
+                "{%- for part in message['content'] -%}"
+                    "{%- if part['type'] == 'text' -%}"
+                        "{{- part['text'] -}}"
+                    "{%- elif part['type'] == 'audio_url' -%}"
+                        "{%- if part.audio_url is string -%}"
+                            "{{- part.audio_url -}}"
+                        "{%- else -%}"
+                            "{{- part.audio_url.url -}}"
+                        "{%- endif -%}"
+                    "{%- elif part['type'] == 'input_audio' -%}"
+                        "{%- if part.input_audio is string -%}"
+                            "{{- part.input_audio -}}"
+                        "{%- elif part.input_audio is mapping and 'data' in part.input_audio -%}"
+                            "{{- 'data:audio/' + part.input_audio.format + ';base64,' + part.input_audio.data -}}"
+                        "{%- endif -%}"
+                    "{%- endif -%}"
+                "{%- endfor -%}"
+            "{%- endif -%}"
+            "{{- '<|end_of_text|>\\n' -}}"
+        "{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+            "{{- '<|start_of_role|>assistant<|end_of_role|>' -}}"
+        "{%- endif -%}"
+    )
+
+    DEFAULT_SYSTEM_MESSAGE = (
+        "You are a helpful AI assistant named Granite, made by IBM."
+    )
+
+    def __call__(self, **kwargs):
+        kwargs['stop'] = [self.GRANITE_EOS_TOKEN, "<|start_of_role|>"]
+
+        llama = kwargs['llama']
+        if hasattr(llama, 'input_ids'):
+            llama.input_ids.fill(0)
+
+        if self.verbose:
+            print(f"{self.log_prefix} - Start processing (Granite Speech)")
 
         return super().__call__(**kwargs)
 
@@ -5409,8 +5750,117 @@ class Qwen3VLChatHandler(MTMDChatHandler):
         if self.verbose:
             print(f"{self.log_prefix}(force_reasoning={self.force_reasoning}) - Start processing")
 
-        # Use parent implementation
-        return super().__call__(**kwargs)
+        response = super().__call__(**kwargs)
+
+        if kwargs.get("stream"):
+            return self._stream_response(response)
+        else:
+            return self._parse_response(response)
+
+    def _parse_response(self, response):
+        message = response.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "") or ""
+
+        if not isinstance(content, str):
+            return response
+
+        # Qwen3VL uses <tool_call>{"name": ..., "arguments": ...}</tool_call>
+        tool_call_pattern = re.compile(r'<tool_call>([\s\S]+?)</tool_call>', re.DOTALL)
+        parsed_tools = []
+
+        for tc_match in tool_call_pattern.finditer(content):
+            raw_json = tc_match.group(1).strip()
+            try:
+                data = json.loads(raw_json)
+                calls = data if isinstance(data, list) else [data]
+                for call in calls:
+                    parsed_tools.append({
+                        "id": f"call_{uuid.uuid4().hex}",
+                        "type": "function",
+                        "function": {
+                            "name": call.get("name"),
+                            "arguments": json.dumps(call.get("arguments", {}))
+                            if isinstance(call.get("arguments"), dict)
+                            else call.get("arguments", "{}"),
+                        },
+                    })
+            except Exception:
+                pass
+
+        content = tool_call_pattern.sub("", content).strip() or None
+        message["content"] = content
+        if parsed_tools:
+            message["tool_calls"] = parsed_tools
+            response["choices"][0]["finish_reason"] = "tool_calls"
+
+        return response
+
+    def _stream_response(self, response: Iterator):
+        buffer = ""
+        in_tool_call = False
+        called_tools = False
+
+        for chunk in response:
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            content = delta.get("content", "") or ""
+
+            buffer += content
+
+            if not in_tool_call and '<tool_call>' in buffer:
+                in_tool_call = True
+                called_tools = True
+                before, after = buffer.split('<tool_call>', 1)
+                if before:
+                    chunk_copy = json.loads(json.dumps(chunk))
+                    chunk_copy["choices"][0]["delta"]["content"] = before
+                    yield chunk_copy
+                buffer = after
+                continue
+
+            if in_tool_call and '</tool_call>' in buffer:
+                raw_json, rest = buffer.split('</tool_call>', 1)
+                buffer = rest
+                in_tool_call = False
+                try:
+                    clean = re.sub(r'```json\s*|\s*```', '', raw_json).strip()
+                    data = json.loads(clean)
+                    calls = data if isinstance(data, list) else [data]
+                    for call in calls:
+                        uid = uuid.uuid4().hex[:10]
+                        chunk_head = json.loads(json.dumps(chunk))
+                        chunk_head["choices"][0]["delta"]["tool_calls"] = [
+                            {"index": 0, "id": f"call_{uid}", "type": "function", "function": {"name": call.get("name")}}
+                        ]
+                        yield chunk_head
+                        chunk_args = json.loads(json.dumps(chunk))
+                        chunk_args["choices"][0]["delta"]["tool_calls"] = [
+                            {"index": 0, "id": f"call_{uid}", "function": {"arguments": json.dumps(call.get("arguments", {}))}}
+                        ]
+                        yield chunk_args
+                except Exception:
+                    chunk_copy = json.loads(json.dumps(chunk))
+                    chunk_copy["choices"][0]["delta"]["content"] = raw_json
+                    yield chunk_copy
+                continue
+
+            if in_tool_call:
+                continue
+
+            if buffer:
+                chunk_copy = json.loads(json.dumps(chunk))
+                chunk_copy["choices"][0]["delta"]["content"] = buffer
+                yield chunk_copy
+                buffer = ""
+
+        if called_tools:
+            import time as _time
+            yield {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion.chunk",
+                "created": int(_time.time()),
+                "model": "qwen3vl",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            }
 
 class Qwen35ChatHandler(MTMDChatHandler):
     """
@@ -5570,12 +6020,13 @@ class Qwen35ChatHandler(MTMDChatHandler):
         "        {{- raise_exception('Unexpected message role.') -}}"
         "    {%- endif -%}"
         "{%- endfor -%}"
+        # Official Qwen3 behavior: NO <think> prefill when enable_thinking=True.
+        # The model generates <think> naturally as its first token.
+        # Only inject empty <think></think> when enable_thinking=False to suppress reasoning.
         "{%- if add_generation_prompt -%}"
         "    {{- '<|im_start|>assistant\n' -}}"
         "    {%- if enable_thinking is defined and enable_thinking is false -%}"
         "        {{- '<think>\n\n</think>\n\n' -}}"
-        "    {%- else -%}"
-        "        {{- '<think>\n' -}}"
         "    {%- endif -%}"
         "{%- endif -%}"
     )
@@ -5607,16 +6058,249 @@ class Qwen35ChatHandler(MTMDChatHandler):
         self.extra_template_arguments["preserve_thinking"] = preserve_thinking
 
     def __call__(self, **kwargs):
-        llama = kwargs['llama']
+        # Normalize messages: flatten list content, parse tool_call arguments to dicts
+        messages = kwargs.get("messages", [])
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                has_image = any(
+                    isinstance(p, dict) and p.get("type") in ["image_url", "image"]
+                    for p in content
+                )
+                if not has_image:
+                    text_parts = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            text_parts.append(p.get("text", ""))
+                        elif isinstance(p, str):
+                            text_parts.append(p)
+                    message["content"] = "\n".join(text_parts)
+            if message.get("tool_calls"):
+                for tc in message["tool_calls"]:
+                    f = tc.get("function")
+                    if f and isinstance(f.get("arguments"), str):
+                        try:
+                            f["arguments"] = json.loads(f["arguments"])
+                        except Exception:
+                            pass
 
+        llama = kwargs['llama']
         if hasattr(llama, 'input_ids'):
             llama.input_ids.fill(0)
 
         if self.verbose:
             print(f"{self.log_prefix}(enable_thinking={self.enable_thinking}, preserve_thinking={self.preserve_thinking}) - Start processing")
 
-        # Use parent implementation
-        return super().__call__(**kwargs)
+        response = super().__call__(**kwargs)
+
+        if kwargs.get("stream"):
+            return self._stream_response(response)
+        else:
+            return self._parse_response(response)
+
+    def _parse_response(self, response):
+        message = response.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "") or ""
+
+        if not isinstance(content, str):
+            return response
+
+        # Extract tool calls: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+        tool_call_pattern = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
+        function_pattern = re.compile(r'<function=(.*?)>(.*?)</function>', re.DOTALL)
+        parameter_pattern = re.compile(r'<parameter=(.*?)>(.*?)</parameter>', re.DOTALL)
+
+        parsed_tools = []
+        for tc_match in tool_call_pattern.finditer(content):
+            raw_tc = tc_match.group(1)
+            for fn_match in function_pattern.finditer(raw_tc):
+                name = fn_match.group(1).strip()
+                args: Dict[str, Any] = {}
+                for pm in parameter_pattern.finditer(fn_match.group(2)):
+                    k = pm.group(1).strip()
+                    v: Any = pm.group(2).strip()
+                    if v.lower() == "true":    v = True
+                    elif v.lower() == "false": v = False
+                    elif v.isdigit():          v = int(v)
+                    else:
+                        try: v = float(v)
+                        except: pass
+                    args[k] = v
+                parsed_tools.append({
+                    "id": f"call_{uuid.uuid4().hex}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)},
+                })
+
+        content = tool_call_pattern.sub("", content).strip() or None
+
+        # Fallback: bare XML with __ in name (smaller models)
+        if not parsed_tools and content:
+            fallback_pattern = re.compile(
+                r'<([a-zA-Z][a-zA-Z0-9_]*__[a-zA-Z0-9_]+)(?:>([\s\S]*?)</\1>|/>|>)',
+                re.DOTALL,
+            )
+            for fb in fallback_pattern.finditer(content):
+                tool_name = fb.group(1)
+                raw_args = (fb.group(2) or "").strip()
+                try:
+                    fb_args = json.loads(raw_args) if raw_args else {}
+                    if not isinstance(fb_args, dict):
+                        fb_args = {}
+                except Exception:
+                    fb_args = {}
+                parsed_tools.append({
+                    "id": f"call_{uuid.uuid4().hex}",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": json.dumps(fb_args)},
+                })
+            if parsed_tools:
+                content = fallback_pattern.sub("", content).strip() or None
+
+        message["content"] = content
+        if parsed_tools:
+            message["tool_calls"] = parsed_tools
+            response["choices"][0]["finish_reason"] = "tool_calls"
+
+        return response
+
+    def _stream_response(self, response: Iterator):
+        current_tag = None
+        buffer = ""
+        called_tools = False
+        uid = None
+        current_tool_name = None
+        current_param_name = None
+        first_param = True
+
+        for chunk in response:
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            content = delta.get("content", "")
+
+            if not content:
+                yield chunk
+                continue
+
+            buffer += content
+
+            if current_tag == 'tool_call':
+                if '</tool_call>' in buffer:
+                    if current_tool_name:
+                        chunk_end = json.loads(json.dumps(chunk))
+                        chunk_end["choices"][0]["delta"]["tool_calls"] = [
+                            {"index": 0, "id": f"call_{uid}", "function": {"arguments": "}"}}
+                        ]
+                        yield chunk_end
+                        current_tool_name = None
+                    _, rest = buffer.split('</tool_call>', 1)
+                    buffer = rest
+                    current_tag = None
+                    continue
+
+                if not current_tool_name:
+                    fn_match = re.search(r'<function=(.*?)>', buffer)
+                    if fn_match:
+                        current_tool_name = fn_match.group(1).strip().replace('"', '').replace("'", "")
+                        uid = uuid.uuid4().hex[:10]
+                        first_param = True
+                        chunk_head = json.loads(json.dumps(chunk))
+                        chunk_head["choices"][0]["delta"]["tool_calls"] = [
+                            {"index": 0, "id": f"call_{uid}", "type": "function", "function": {"name": current_tool_name}}
+                        ]
+                        yield chunk_head
+                        chunk_open = json.loads(json.dumps(chunk))
+                        chunk_open["choices"][0]["delta"]["tool_calls"] = [
+                            {"index": 0, "id": f"call_{uid}", "function": {"arguments": "{"}}
+                        ]
+                        yield chunk_open
+                        buffer = buffer.split(fn_match.group(0), 1)[1]
+                        continue
+
+                if current_tool_name and '</function>' in buffer:
+                    chunk_end = json.loads(json.dumps(chunk))
+                    chunk_end["choices"][0]["delta"]["tool_calls"] = [
+                        {"index": 0, "id": f"call_{uid}", "function": {"arguments": "}"}}
+                    ]
+                    yield chunk_end
+                    current_tool_name = None
+                    _, rest = buffer.split('</function>', 1)
+                    buffer = rest
+                    continue
+
+                if current_tool_name:
+                    if not current_param_name:
+                        pm = re.search(r'<parameter=(.*?)>', buffer)
+                        if pm:
+                            current_param_name = pm.group(1).strip().replace('"', '').replace("'", "")
+                            buffer = buffer.split(pm.group(0), 1)[1]
+
+                    if current_param_name and '</parameter>' in buffer:
+                        val, rest = buffer.split('</parameter>', 1)
+                        val = val.strip()
+                        v_lower = val.lower()
+                        if v_lower == "true":    val_parsed: Any = True
+                        elif v_lower == "false": val_parsed = False
+                        elif val.isdigit():      val_parsed = int(val)
+                        else:
+                            try: val_parsed = float(val)
+                            except: val_parsed = val
+                        arg_delta = f"{'' if first_param else ', '}{json.dumps(current_param_name)}: {json.dumps(val_parsed)}"
+                        first_param = False
+                        chunk_args = json.loads(json.dumps(chunk))
+                        chunk_args["choices"][0]["delta"]["tool_calls"] = [
+                            {"index": 0, "id": f"call_{uid}", "function": {"arguments": arg_delta}}
+                        ]
+                        yield chunk_args
+                        buffer = rest
+                        current_param_name = None
+                        continue
+
+                if len(buffer) > 1000 and '<' not in buffer:
+                    buffer = ""
+                continue
+
+            if '<tool_call>' in buffer:
+                current_tag = 'tool_call'
+                called_tools = True
+                before, after = buffer.split('<tool_call>', 1)
+                if before:
+                    chunk_copy = json.loads(json.dumps(chunk))
+                    chunk_copy["choices"][0]["delta"]["content"] = before
+                    yield chunk_copy
+                buffer = after
+                continue
+
+            while buffer:
+                idx = buffer.find('<')
+                if idx > 0:
+                    chunk_copy = json.loads(json.dumps(chunk))
+                    chunk_copy["choices"][0]["delta"]["content"] = buffer[:idx]
+                    yield chunk_copy
+                    buffer = buffer[idx:]
+                elif idx == 0:
+                    if "<tool_call>".startswith(buffer):
+                        break
+                    else:
+                        chunk_copy = json.loads(json.dumps(chunk))
+                        chunk_copy["choices"][0]["delta"]["content"] = "<"
+                        yield chunk_copy
+                        buffer = buffer[1:]
+                else:
+                    chunk_copy = json.loads(json.dumps(chunk))
+                    chunk_copy["choices"][0]["delta"]["content"] = buffer
+                    yield chunk_copy
+                    buffer = ""
+                    break
+
+        if called_tools:
+            import time as _time
+            yield {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion.chunk",
+                "created": int(_time.time()),
+                "model": "qwen35",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            }
 
 
 class Step3VLChatHandler(MTMDChatHandler):

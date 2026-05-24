@@ -916,8 +916,10 @@ class llama_context_params(ctypes.Structure):
         n_batch: int
         n_ubatch: int
         n_seq_max: int
+        n_rs_seq: int
         n_threads: int
         n_threads_batch: int
+        ctx_type: int
         rope_scaling_type: int
         pooling_type: int
         attention_type: int
@@ -950,8 +952,10 @@ class llama_context_params(ctypes.Structure):
         ("n_batch", ctypes.c_uint32),
         ("n_ubatch", ctypes.c_uint32),
         ("n_seq_max", ctypes.c_uint32),
+        ("n_rs_seq", ctypes.c_uint32),      # number of recurrent-state snapshots per seq (b9305)
         ("n_threads", ctypes.c_int32),
         ("n_threads_batch", ctypes.c_int32),
+        ("ctx_type", ctypes.c_int),          # llama_context_type: DEFAULT=0, MTP=1 (b9305)
         ("rope_scaling_type", ctypes.c_int),
         ("pooling_type", ctypes.c_int),
         ("attention_type", ctypes.c_int),
